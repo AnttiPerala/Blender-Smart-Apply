@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Smart Apply Scene",
     "author": "Assistant",
-    "version": (8, 0, 0),
+    "version": (8, 1, 0),
     "blender": (3, 0, 0),
     "location": "View3D > N-Panel > Clean Scene",
     "description": "Applies transforms with hierarchy safety and animation-aware options.",
@@ -9,6 +9,7 @@ bl_info = {
 }
 
 import bpy
+import mathutils
 import traceback
 
 class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
@@ -25,6 +26,26 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
         targets = []
         skipped_animated = 0
         animation_warnings = 0
+        scale_baked_objects = set()
+        debug_changed_count = 0
+        world_compensated_count = 0
+        animated_world_samples = {}
+
+        def vec3_to_str(v):
+            return f"({v.x:.6f}, {v.y:.6f}, {v.z:.6f})"
+
+        def get_world_bbox_size(obj):
+            try:
+                corners = [obj.matrix_world @ mathutils.Vector(corner) for corner in obj.bound_box]
+                min_x = min(v.x for v in corners)
+                min_y = min(v.y for v in corners)
+                min_z = min(v.z for v in corners)
+                max_x = max(v.x for v in corners)
+                max_y = max(v.y for v in corners)
+                max_z = max(v.z for v in corners)
+                return mathutils.Vector((max_x - min_x, max_y - min_y, max_z - min_z))
+            except Exception:
+                return mathutils.Vector((0.0, 0.0, 0.0))
 
         def ensure_object_mode():
             if context.mode != 'OBJECT':
@@ -84,6 +105,7 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                     "parent_type": obj.parent_type,
                     "parent_bone": obj.parent_bone,
                     "has_animation": has_anim,
+                    "has_rotation_fcurves": False,
                     # Store ORIGINAL World Matrix. This is the absolute truth of where the object is.
                     "stored_matrix_world": obj.matrix_world.copy(),
                     # Store pre-apply local transforms for animation correction
@@ -92,7 +114,49 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                     "stored_rot_quat": obj.rotation_quaternion.copy() if obj.rotation_mode == 'QUATERNION' else None,
                     "stored_rot_axis_angle": obj.rotation_axis_angle[:] if obj.rotation_mode == 'AXIS_ANGLE' else None,
                     "stored_scale": obj.scale.copy(),
+                    "stored_world_scale": obj.matrix_world.to_scale().copy(),
+                    "stored_world_dimensions": obj.dimensions.copy(),
+                    "stored_world_bbox_size": get_world_bbox_size(obj),
+                    "desired_matrix_world": obj.matrix_world.copy(),
+                    "transform_applied": False,
                 }
+                if has_anim:
+                    action = obj.animation_data.action
+                    relationships[obj]["has_rotation_fcurves"] = any(
+                        fc.data_path.endswith("rotation_euler") or
+                        fc.data_path.endswith("rotation_quaternion") or
+                        fc.data_path.endswith("rotation_axis_angle")
+                        for fc in action.fcurves
+                    )
+
+            # Cache animated world-space motion before editing hierarchy/transforms.
+            if props.compensate_anim_world_keys and props.apply_scale:
+                current_frame = scene.frame_current
+                current_subframe = scene.frame_subframe
+                try:
+                    for obj in targets:
+                        if not relationships[obj]["has_animation"]:
+                            continue
+                        action = obj.animation_data.action
+                        keyed_frames = sorted({
+                            kf.co[0]
+                            for fc in action.fcurves
+                            for kf in fc.keyframe_points
+                        })
+                        if not keyed_frames:
+                            continue
+                        frame_world = {}
+                        for frame_value in keyed_frames:
+                            frame_int = int(frame_value)
+                            subframe = float(frame_value - frame_int)
+                            scene.frame_set(frame_int, subframe=subframe)
+                            frame_world[frame_value] = obj.matrix_world.copy()
+                        animated_world_samples[obj] = {
+                            "frames": keyed_frames,
+                            "world_matrices": frame_world,
+                        }
+                finally:
+                    scene.frame_set(current_frame, subframe=current_subframe)
                 
             # --- 3. DETACH HIERARCHY ---
             select_and_activate(targets)
@@ -142,6 +206,12 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                 if props.animated_handling == 'SCALE_ONLY':
                     animated_geo = [o for o in group_bake if relationships[o]["has_animation"]]
                     static_geo = [o for o in group_bake if not relationships[o]["has_animation"]]
+                    # Protect rotating animated parts (e.g. rotor hubs): don't bake their scale
+                    # because changing data-space basis can alter perceived pivot behavior.
+                    animated_geo_safe = [o for o in animated_geo if not relationships[o]["has_rotation_fcurves"]]
+                    skipped_rot_animated = len(animated_geo) - len(animated_geo_safe)
+                    if skipped_rot_animated:
+                        skipped_animated += skipped_rot_animated
 
                     if static_geo:
                         select_and_activate(static_geo)
@@ -150,24 +220,35 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                             rotation=apply_rot,
                             scale=apply_scale
                         )
-                    if animated_geo and apply_scale:
-                        select_and_activate(animated_geo)
+                        if apply_loc or apply_rot or apply_scale:
+                            for o in static_geo:
+                                relationships[o]["transform_applied"] = True
+                        if apply_scale:
+                            scale_baked_objects.update(static_geo)
+                    if animated_geo_safe and apply_scale:
+                        select_and_activate(animated_geo_safe)
                         bpy.ops.object.transform_apply(
                             location=False,
                             rotation=False,
                             scale=True
                         )
+                        for o in animated_geo_safe:
+                            relationships[o]["transform_applied"] = True
+                        scale_baked_objects.update(animated_geo_safe)
                 else:
                     bpy.ops.object.transform_apply(
                         location=apply_loc,
                         rotation=apply_rot,
                         scale=apply_scale
                     )
-            # Manual reset for Empties/Cameras
-            # We avoid location/rotation resets to prevent visual teleports.
-            for obj in group_manual:
-                if props.apply_scale:
-                    obj.scale = (1.0, 1.0, 1.0)
+                    if apply_loc or apply_rot or apply_scale:
+                        for o in group_bake:
+                            relationships[o]["transform_applied"] = True
+                    if apply_scale:
+                        scale_baked_objects.update(group_bake)
+
+            # Manual objects (EMPTY/LIGHT/CAMERA/SPEAKER) are intentionally left untouched.
+            # Non-geometry "scale apply" cannot be baked into data without changing visuals.
 
             # --- 6. CORRECT ANIMATION ---
             wm.progress_update(50)
@@ -176,6 +257,10 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                     if not relationships[obj]["has_animation"]:
                         continue
                     if props.animated_handling == 'SKIP_ALL':
+                        continue
+                    if obj not in scale_baked_objects:
+                        continue
+                    if obj in animated_world_samples:
                         continue
                     if not obj.animation_data or not obj.animation_data.action:
                         continue
@@ -206,6 +291,10 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                     bpy.ops.mesh.normals_make_consistent(inside=False)
                     bpy.ops.object.mode_set(mode='OBJECT')
 
+            # Capture desired world transforms after all transform operations.
+            for obj in targets:
+                relationships[obj]["desired_matrix_world"] = obj.matrix_world.copy()
+
             # --- 8. REBUILD HIERARCHY (Optimized) ---
             print("Step 8: Rebuilding Hierarchy...")
             wm.progress_update(70)
@@ -219,9 +308,8 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
             for obj, data in relationships.items():
                 parent = data["parent"]
 
-                # We always enforce the stored World Matrix.
-                # This ensures children stay visually stable.
                 original_mw = data["stored_matrix_world"]
+                desired_mw = data["desired_matrix_world"]
 
                 if parent:
                     obj.parent = parent
@@ -229,11 +317,41 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                     if data["parent_bone"] and data["parent_type"] == 'BONE':
                         obj.parent_bone = data["parent_bone"]
 
-                obj.matrix_world = original_mw
+                # If transforms were baked/reset, keep post-apply world matrix.
+                # Otherwise restore original world matrix.
+                if data["transform_applied"]:
+                    obj.matrix_world = desired_mw
+                else:
+                    obj.matrix_world = original_mw
 
                 count += 1
                 if count % 20 == 0:
                     wm.progress_update(70 + int((count / total) * 25))
+
+            # Re-key animated objects to preserve original world motion.
+            if animated_world_samples:
+                current_frame = scene.frame_current
+                current_subframe = scene.frame_subframe
+                try:
+                    for obj, sample_data in animated_world_samples.items():
+                        if obj.name not in bpy.data.objects:
+                            continue
+                        for frame_value in sample_data["frames"]:
+                            frame_int = int(frame_value)
+                            subframe = float(frame_value - frame_int)
+                            scene.frame_set(frame_int, subframe=subframe)
+                            obj.matrix_world = sample_data["world_matrices"][frame_value]
+                            obj.keyframe_insert(data_path="location", frame=frame_value)
+                            if obj.rotation_mode == 'QUATERNION':
+                                obj.keyframe_insert(data_path="rotation_quaternion", frame=frame_value)
+                            elif obj.rotation_mode == 'AXIS_ANGLE':
+                                obj.keyframe_insert(data_path="rotation_axis_angle", frame=frame_value)
+                            else:
+                                obj.keyframe_insert(data_path="rotation_euler", frame=frame_value)
+                            obj.keyframe_insert(data_path="scale", frame=frame_value)
+                        world_compensated_count += 1
+                finally:
+                    scene.frame_set(current_frame, subframe=current_subframe)
 
             # --- 9. RESTORE VISIBILITY ---
             wm.progress_update(99)
@@ -245,6 +363,49 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                         obj.hide_set(True)
                 except Exception as visibility_error:
                     print(f"Visibility restore warning for {obj.name}: {visibility_error}")
+
+            # --- 10. DEBUG SCALE CHECK ---
+            if props.debug_logging:
+                print("\n=== Smart Apply Debug: Scale Verification ===")
+                print(f"Tolerance: {props.debug_tolerance:.8f}")
+                for obj in targets:
+                    pre = relationships[obj]["stored_world_scale"]
+                    post = obj.matrix_world.to_scale()
+                    delta = post - pre
+                    max_delta = max(abs(delta.x), abs(delta.y), abs(delta.z))
+                    changed = max_delta > props.debug_tolerance
+                    if changed:
+                        debug_changed_count += 1
+
+                    baked = obj in scale_baked_objects
+                    pre_dims = relationships[obj]["stored_world_dimensions"]
+                    post_dims = obj.dimensions.copy()
+                    dim_delta = post_dims - pre_dims
+                    pre_bbox = relationships[obj]["stored_world_bbox_size"]
+                    post_bbox = get_world_bbox_size(obj)
+                    bbox_delta = post_bbox - pre_bbox
+                    pre_local = relationships[obj]["stored_scale"]
+                    post_local = obj.scale.copy()
+                    print(
+                        "[SmartApplyDebug] "
+                        f"name='{obj.name}' "
+                        f"baked_scale={baked} "
+                        f"transform_applied={relationships[obj]['transform_applied']} "
+                        f"animated={relationships[obj]['has_animation']} "
+                        f"pre_ws={vec3_to_str(pre)} "
+                        f"post_ws={vec3_to_str(post)} "
+                        f"delta={vec3_to_str(delta)} "
+                        f"pre_local_scale={vec3_to_str(pre_local)} "
+                        f"post_local_scale={vec3_to_str(post_local)} "
+                        f"pre_dims={vec3_to_str(pre_dims)} "
+                        f"post_dims={vec3_to_str(post_dims)} "
+                        f"dim_delta={vec3_to_str(dim_delta)} "
+                        f"pre_bbox={vec3_to_str(pre_bbox)} "
+                        f"post_bbox={vec3_to_str(post_bbox)} "
+                        f"bbox_delta={vec3_to_str(bbox_delta)} "
+                        f"changed={changed}"
+                    )
+                print(f"=== Smart Apply Debug Summary: changed={debug_changed_count}/{len(targets)} ===\n")
 
         except Exception as exc:
             traceback.print_exc()
@@ -260,6 +421,10 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
             info_parts.append(f"Skipped animated: {skipped_animated}.")
         if animation_warnings:
             info_parts.append(f"Animated risk warning on {animation_warnings} object(s).")
+        if world_compensated_count:
+            info_parts.append(f"World-compensated animated: {world_compensated_count}.")
+        if props.debug_logging:
+            info_parts.append(f"Debug scale changed: {debug_changed_count}.")
         self.report({'INFO'}, " ".join(info_parts))
         return {'FINISHED'}
 
@@ -289,6 +454,10 @@ class VIEW3D_PT_smart_apply_ui(bpy.types.Panel):
         col2.prop(props, "isolate_data", text="Isolate Multi-User")
         col2.prop(props, "fix_normals", text="Fix Normals")
         col2.prop(props, "correct_scale_keys", text="Correct Scale Keyframes")
+        col2.prop(props, "compensate_anim_world_keys", text="Compensate Animated World Motion")
+        col2.prop(props, "debug_logging", text="Debug Logging")
+        if props.debug_logging:
+            col2.prop(props, "debug_tolerance", text="Debug Tolerance")
 
         layout.separator()
 
@@ -311,6 +480,23 @@ class SmartApplySettings(bpy.types.PropertyGroup):
         name="Correct Scale Keyframes",
         description="When scale is applied, divide scale keyframe values by original scale",
         default=True
+    )
+    compensate_anim_world_keys: bpy.props.BoolProperty(
+        name="Compensate Animated World Motion",
+        description="Re-key animated objects at their existing keyframes to preserve world-space motion after apply",
+        default=True
+    )
+    debug_logging: bpy.props.BoolProperty(
+        name="Debug Logging",
+        description="Print per-object scale diagnostics to Blender console",
+        default=False
+    )
+    debug_tolerance: bpy.props.FloatProperty(
+        name="Debug Tolerance",
+        description="Delta threshold above which scale is flagged as changed",
+        default=0.0001,
+        min=0.0,
+        precision=6
     )
     animated_handling: bpy.props.EnumProperty(
         name="Animated Handling",
