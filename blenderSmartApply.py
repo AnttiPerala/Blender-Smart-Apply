@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Smart Apply Scene",
     "author": "Assistant",
-    "version": (8, 1, 0),
+    "version": (8, 1, 4),
     "blender": (3, 0, 0),
     "location": "View3D > N-Panel > Clean Scene",
     "description": "Applies transforms with hierarchy safety and animation-aware options.",
@@ -30,6 +30,8 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
         debug_changed_count = 0
         world_compensated_count = 0
         animated_world_samples = {}
+        selected_seed_count = 0
+        linked_added_count = 0
 
         def vec3_to_str(v):
             return f"({v.x:.6f}, {v.y:.6f}, {v.z:.6f})"
@@ -69,22 +71,50 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
             # --- 1. PREPARATION ---
             print("Step 1: Analyzing Scene...")
             valid_types = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA', 'SPEAKER'}
+            linkable_data_types = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META', 'ARMATURE'}
             visibility_state = {}
             
-            view_layer_objects = context.view_layer.objects
-            
-            for obj in view_layer_objects:
-                if obj.type in valid_types:
-                    # Handle Visibility
-                    is_global_hidden = obj.hide_viewport
-                    is_local_hidden = obj.hide_get()
-                    
-                    if is_global_hidden or is_local_hidden:
-                        visibility_state[obj] = {'global': is_global_hidden, 'local': is_local_hidden}
-                        obj.hide_viewport = False
-                        obj.hide_set(False)
-                    
-                    targets.append(obj)
+            view_layer_objects = list(context.view_layer.objects)
+            target_candidates = []
+
+            if props.selection_only:
+                selected_seed = [
+                    obj for obj in context.selected_objects
+                    if obj in view_layer_objects and obj.type in valid_types
+                ]
+                selected_seed_count = len(selected_seed)
+                if not selected_seed:
+                    self.report({'WARNING'}, "No valid selected objects found.")
+                    return {'CANCELLED'}
+
+                # Start from selected objects, then include linked multi-user siblings.
+                target_set = set(selected_seed)
+                for obj in selected_seed:
+                    if obj.type in linkable_data_types and obj.data:
+                        for other in view_layer_objects:
+                            if (
+                                other.type == obj.type and
+                                other.data and
+                                other.data == obj.data and
+                                other not in target_set
+                            ):
+                                target_set.add(other)
+                                linked_added_count += 1
+                target_candidates = [obj for obj in view_layer_objects if obj in target_set]
+            else:
+                target_candidates = [obj for obj in view_layer_objects if obj.type in valid_types]
+
+            for obj in target_candidates:
+                # Handle Visibility
+                is_global_hidden = obj.hide_viewport
+                is_local_hidden = obj.hide_get()
+
+                if is_global_hidden or is_local_hidden:
+                    visibility_state[obj] = {'global': is_global_hidden, 'local': is_local_hidden}
+                    obj.hide_viewport = False
+                    obj.hide_set(False)
+
+                targets.append(obj)
                     
             if not targets:
                 self.report({'WARNING'}, "No objects found.")
@@ -105,6 +135,8 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                     "parent_type": obj.parent_type,
                     "parent_bone": obj.parent_bone,
                     "has_animation": has_anim,
+                    "has_location_fcurves": False,
+                    "has_scale_fcurves": False,
                     "has_rotation_fcurves": False,
                     # Store ORIGINAL World Matrix. This is the absolute truth of where the object is.
                     "stored_matrix_world": obj.matrix_world.copy(),
@@ -122,10 +154,20 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                 }
                 if has_anim:
                     action = obj.animation_data.action
+                    # Only count a channel as "animated" if it actually has keyframe points.
                     relationships[obj]["has_rotation_fcurves"] = any(
-                        fc.data_path.endswith("rotation_euler") or
-                        fc.data_path.endswith("rotation_quaternion") or
-                        fc.data_path.endswith("rotation_axis_angle")
+                        (fc.data_path.endswith("rotation_euler") or
+                         fc.data_path.endswith("rotation_quaternion") or
+                         fc.data_path.endswith("rotation_axis_angle")) and
+                        len(fc.keyframe_points) > 0
+                        for fc in action.fcurves
+                    )
+                    relationships[obj]["has_location_fcurves"] = any(
+                        fc.data_path.endswith("location") and len(fc.keyframe_points) > 0
+                        for fc in action.fcurves
+                    )
+                    relationships[obj]["has_scale_fcurves"] = any(
+                        fc.data_path.endswith("scale") and len(fc.keyframe_points) > 0
                         for fc in action.fcurves
                     )
 
@@ -206,12 +248,15 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                 if props.animated_handling == 'SCALE_ONLY':
                     animated_geo = [o for o in group_bake if relationships[o]["has_animation"]]
                     static_geo = [o for o in group_bake if not relationships[o]["has_animation"]]
-                    # Protect rotating animated parts (e.g. rotor hubs): don't bake their scale
-                    # because changing data-space basis can alter perceived pivot behavior.
-                    animated_geo_safe = [o for o in animated_geo if not relationships[o]["has_rotation_fcurves"]]
+                    # In SCALE_ONLY mode we can optionally bake scale even for rot-animated objects
+                    # if we preserve their world motion (compensation) at their keyed frames.
+                    if props.compensate_anim_world_keys:
+                        animated_geo_safe = list(animated_geo)
+                    else:
+                        # Protect rotating animated parts (e.g. rotor hubs) if compensation is off.
+                        animated_geo_safe = [o for o in animated_geo if not relationships[o]["has_rotation_fcurves"]]
                     skipped_rot_animated = len(animated_geo) - len(animated_geo_safe)
-                    if skipped_rot_animated:
-                        skipped_animated += skipped_rot_animated
+                    skipped_animated += skipped_rot_animated
 
                     if static_geo:
                         select_and_activate(static_geo)
@@ -336,19 +381,53 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
                     for obj, sample_data in animated_world_samples.items():
                         if obj.name not in bpy.data.objects:
                             continue
+                        has_loc = relationships.get(obj, {}).get("has_location_fcurves", False)
+                        has_rot = relationships.get(obj, {}).get("has_rotation_fcurves", False)
+                        has_scale = relationships.get(obj, {}).get("has_scale_fcurves", False)
+                        # If there are no scale f-curves, do NOT force obj.scale
+                        # (assignment to obj.matrix_world can change the scale property).
+                        kept_scale = obj.scale.copy()
+                        parent_inv = (
+                            obj.parent.matrix_world.inverted()
+                            if obj.parent
+                            else mathutils.Matrix.Identity(4)
+                        )
                         for frame_value in sample_data["frames"]:
                             frame_int = int(frame_value)
                             subframe = float(frame_value - frame_int)
                             scene.frame_set(frame_int, subframe=subframe)
-                            obj.matrix_world = sample_data["world_matrices"][frame_value]
-                            obj.keyframe_insert(data_path="location", frame=frame_value)
-                            if obj.rotation_mode == 'QUATERNION':
-                                obj.keyframe_insert(data_path="rotation_quaternion", frame=frame_value)
-                            elif obj.rotation_mode == 'AXIS_ANGLE':
-                                obj.keyframe_insert(data_path="rotation_axis_angle", frame=frame_value)
+                            desired_world = sample_data["world_matrices"][frame_value]
+                            desired_local = parent_inv @ desired_world
+                            loc_local, rot_local, scale_local = desired_local.decompose()
+
+                            if has_loc:
+                                obj.location = loc_local
+
+                            if has_rot:
+                                if obj.rotation_mode == 'QUATERNION':
+                                    obj.rotation_quaternion = rot_local
+                                elif obj.rotation_mode == 'AXIS_ANGLE':
+                                    axis, angle = rot_local.to_axis_angle()
+                                    obj.rotation_axis_angle = (axis.x, axis.y, axis.z, angle)
+                                else:
+                                    obj.rotation_euler = rot_local.to_euler()
+
+                            if has_scale:
+                                obj.scale = scale_local
                             else:
-                                obj.keyframe_insert(data_path="rotation_euler", frame=frame_value)
-                            obj.keyframe_insert(data_path="scale", frame=frame_value)
+                                obj.scale = kept_scale
+
+                            if has_loc:
+                                obj.keyframe_insert(data_path="location", frame=frame_value)
+                            if has_rot:
+                                if obj.rotation_mode == 'QUATERNION':
+                                    obj.keyframe_insert(data_path="rotation_quaternion", frame=frame_value)
+                                elif obj.rotation_mode == 'AXIS_ANGLE':
+                                    obj.keyframe_insert(data_path="rotation_axis_angle", frame=frame_value)
+                                else:
+                                    obj.keyframe_insert(data_path="rotation_euler", frame=frame_value)
+                            if has_scale:
+                                obj.keyframe_insert(data_path="scale", frame=frame_value)
                         world_compensated_count += 1
                 finally:
                     scene.frame_set(current_frame, subframe=current_subframe)
@@ -423,6 +502,8 @@ class OBJECT_OT_smart_apply_instant(bpy.types.Operator):
             info_parts.append(f"Animated risk warning on {animation_warnings} object(s).")
         if world_compensated_count:
             info_parts.append(f"World-compensated animated: {world_compensated_count}.")
+        if props.selection_only:
+            info_parts.append(f"Selection mode: seed={selected_seed_count}, linked_added={linked_added_count}.")
         if props.debug_logging:
             info_parts.append(f"Debug scale changed: {debug_changed_count}.")
         self.report({'INFO'}, " ".join(info_parts))
@@ -445,6 +526,7 @@ class VIEW3D_PT_smart_apply_ui(bpy.types.Panel):
         col.prop(props, "apply_loc")
         col.prop(props, "apply_rot")
         col.prop(props, "apply_scale")
+        col.prop(props, "selection_only", text="Selection Only (+ linked multi-user)")
         
         layout.separator()
         
@@ -474,6 +556,11 @@ class SmartApplySettings(bpy.types.PropertyGroup):
     apply_loc: bpy.props.BoolProperty(name="Location", default=False)
     apply_rot: bpy.props.BoolProperty(name="Rotation", default=True)
     apply_scale: bpy.props.BoolProperty(name="Scale", default=True)
+    selection_only: bpy.props.BoolProperty(
+        name="Selection Only",
+        description="Process only selected objects, plus any view-layer objects sharing the same linked object-data",
+        default=True
+    )
     isolate_data: bpy.props.BoolProperty(name="Isolate Multi-User", default=True)
     fix_normals: bpy.props.BoolProperty(name="Fix Normals", default=True)
     correct_scale_keys: bpy.props.BoolProperty(
